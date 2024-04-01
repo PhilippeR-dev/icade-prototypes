@@ -1,4 +1,4 @@
-###### Installation de Streamlit
+### Installation de Streamlit
 
 Prérepris :
 
@@ -38,7 +38,13 @@ Installation :
   (base) c:\Repos\edhec-expert>C:\apps\Anaconda\python.exe -m pip install streamlit-extras
   ```
 
-###### Exécution du programme
+  Option : Afficher les packages python installés `conda list`
+* Base de données Snowflake
+
+  > Créer la base de données ICADE et le schéma PROTOTYPES puis exécuter le script create_table_suivi_budgetaire.sql
+  >
+
+### Exécution du programme
 
 ```
 (base) C:\Repos\icade-prototypes>streamlit run c:\Repos\icade-prototypes\suivi_budgetaire_analysis.py

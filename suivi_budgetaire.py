@@ -1,8 +1,9 @@
 import snowflake.snowpark
 from snowflake.snowpark.session import Session
-from snowflake.snowpark.functions import col, lit
+from snowflake.snowpark.functions import col, lit, replace, coalesce, iff
 from snowflake.snowpark.dataframe import DataFrame
 from snowflake.snowpark.functions import sproc, sql_expr, is_boolean
+import snowflake.snowpark.types as types
 import streamlit as st
 from streamlit_extras.st_keyup import st_keyup
 import os
@@ -11,6 +12,8 @@ import pandas as pd
 import configparser
 import unicodedata
 import re
+import locale
+import random
 
 
 # Function to create Snowflake Session to connect to Snowflake
@@ -25,7 +28,7 @@ def create_session():
     config_parser.read(snowsql_config_file)
 
     # Nom de la connexion à récupérer
-    nom_connexion = "connections.my_EDHEC_Lab"
+    nom_connexion = "connections.my_SYNERGY_Lab"
 
     # Accéder à la section de configuration correspondant à la connexion spécifique
     connection_section = config_parser[nom_connexion]
@@ -36,9 +39,10 @@ def create_session():
     snowflake_password = connection_section.get('password')
     snowflake_role = connection_section.get('rolename')
     snowflake_warehouse = connection_section.get('warehousename')
-    snowflake_database = connection_section.get('dbname')
+    #snowflake_database = connection_section.get('dbname')
     #snowflake_schema = connection_section.get('schemaname')
-    snowflake_schema = 'PUBLIC'
+    snowflake_database = 'ICADE'
+    snowflake_schema = 'PROTOTYPES'
     
     connection_parameters = {
         "account": snowflake_account,
@@ -57,44 +61,111 @@ def create_session():
         session = st.session_state['snowpark_session']
     return session
 
-
-def load_ref_list(session_df_name,list_name,column_name):
-    if list_name not in st.session_state:
-        pd_df_entity = st.session_state[session_df_name].select(col(column_name)).to_pandas()
-        entity_list = pd_df_entity.loc[:,column_name].to_list()
-        st.session_state[list_name] = entity_list
-       
-def remove_special_chars(N):
-    # Normaliser la chaîne en utilisant la forme décomposée Unicode (NFD)
-    normalized = unicodedata.normalize('NFD', N)
-    # Remplacer tous les caractères diacritiques par une chaîne vide
-    removed = re.sub(r'[\u0300-\u036f]', '', normalized)
-    # Remplacer les tirets et les espaces par une chaîne vide
-    replaced = removed.replace('-', '').replace(' ', '')
-    return replaced
+def load_bm_table(session,table_name,financial_year=2024):
+    if 'df_all_budgets' not in st.session_state:
+        #st.session_state['df_budget'] = session.table(table_name)
+        abm_df=session.sql(f" SELECT  CODE_TYPE_FLUX,TYPE_FLUX \
+                                    ,CODE_IMPUTATION, IMPUTATION \
+                                    ,ANNEE, CODE_MOIS, MOIS \
+                                    ,M_PREVISIONNEL, M_REEL \
+                            FROM ICADE.PROTOTYPES.{table_name} \
+                            ORDER BY CODE_TYPE_FLUX,CODE_IMPUTATION,ANNEE,CODE_MOIS" )
+        st.session_state['df_all_budgets']=abm_df
+        # financial years list
+        spdf_fy=abm_df.select(col("ANNEE")).distinct()
+        pddf_fy=spdf_fy.to_pandas()
+        st.session_state['financial_years_list']=pddf_fy.sort_values(by=['ANNEE'], ascending=False).loc[:,"ANNEE"].to_list()
+        # budget monitoring dataframe 
+        st.session_state['financial_year']=financial_year
+        st.session_state['df_budget']=abm_df.filter(col("ANNEE") == financial_year)   
         
-def get_dataset_places_postcodes(session_snow,p_country_code,p_city_name="n/a",p_postcode="n/a",p_df_country=None):
-
-    v_city_name_modified=remove_special_chars(p_city_name).upper()
-    v_postcode_modified=remove_special_chars(p_postcode).upper()
-    if (p_city_name == "n/a" or v_city_name_modified == '') and (p_postcode == "n/a" or v_postcode_modified != ''):
-        df=session_snow.sql("SELECT  COUNTRY_CODE, COUNTRY_NAME, \
-                                     PLACE_ID, LOCALITY, NEUTRAL_LOCALITY, \
-                                     POSTCODE_ID, POSTCODE, NEUTRAL_POSTCODE, \
-                                     REGION_ID, REGION_NAME \
-                             FROM REF_DEV.PUBLIC.COUNTRY_PLACES_POSTCODES_SEARCH \
-                             WHERE COUNTRY_CODE = ? \
-                            ", params=[p_country_code] )
-    elif (p_city_name != "n/a" and v_city_name_modified != '') and p_postcode == "n/a": 
-        df=p_df_country.filter(col("NEUTRAL_LOCALITY").startswith(v_city_name_modified))
-    elif p_city_name == "n/a" and (p_postcode != "n/a" and v_postcode_modified != '') :
-        df=p_df_country.filter(col("NEUTRAL_POSTCODE").startswith(v_postcode_modified))    
-    elif (p_city_name != "n/a" and v_city_name_modified != '') and (p_postcode != "n/a" and v_postcode_modified != ''):
-        df=p_df_country.filter((col("NEUTRAL_LOCALITY").startswith(v_city_name_modified)) & (col("NEUTRAL_POSTCODE").startswith(v_postcode_modified)))          
-
-    return df              
+        update_var_pivot(st.session_state['df_budget'])
+        
+        st.session_state["data_editor_forecasted_budget_key"]=0
+        st.session_state["data_editor_forecasted_budget"]="data_editor_forecasted_budget_0"
+        st.session_state['update_tag']=False
+        st.session_state['updated_df']=None
+        st.session_state['validate_save']=None
+                   
+        #st.write('initialisation')
+         
     
-      
+# def load_fy_list():
+#     if 'financial_years_list' not in st.session_state:
+#         abm_df=st.session_state['df_all_budgets']
+#         spdf_fy=abm_df.select(col("ANNEE")).distinct()
+#         pddf_fy=spdf_fy.to_pandas()
+#         st.session_state['financial_years_list']=pddf_fy.sort_values(by=['ANNEE'], ascending=False).loc[:,"ANNEE"].to_list()
+
+def tag_save_changes():
+    st.session_state['update_tag']=True
+        
+def save_changes():
+    efb_spdf = st.session_state['edited_forecasted_budget_spdf']
+    # Convertir les colonnes de type LongType contenant des valeurs nulles en DoubleType
+    for column in st.session_state['months_quoted']: 
+        efb_spdf = efb_spdf.withColumn(column, efb_spdf[column].cast("DOUBLE"))
+    
+    unpivot_forecasted_budget_df=efb_spdf.unpivot("M_PREVISIONNEL","MOIS", st.session_state['months_quoted']) \
+                                                                    .withColumn("MOIS", replace("MOIS","'",""))
+    unpivot_months_fb_df = unpivot_forecasted_budget_df.join(st.session_state['spdf_months'], on=["MOIS"], how="inner")
+    
+    abm_df=st.session_state['df_all_budgets']      
+    updated_df=abm_df.join(unpivot_months_fb_df, on=["CODE_TYPE_FLUX","CODE_IMPUTATION","ANNEE","CODE_MOIS"], how="leftouter", rsuffix="_L", lsuffix="_R") \
+                    .select(    col("CODE_TYPE_FLUX"),col("TYPE_FLUX_R").alias("TYPE_FLUX"), \
+                                col("CODE_IMPUTATION"),col("IMPUTATION_R").alias("IMPUTATION"), \
+                                col("ANNEE"),col("CODE_MOIS"),col("MOIS_R").alias("MOIS"), col("MOIS_L"), \
+                                iff(col("MOIS_L").isNull(),col("M_PREVISIONNEL_R"),col("M_PREVISIONNEL_L")).alias("M_PREVISIONNEL") \
+                                ,"M_PREVISIONNEL_R","M_PREVISIONNEL_L",col("M_REEL") ) \
+                    .drop("M_PREVISIONNEL_R","M_PREVISIONNEL_L","MOIS_L") \
+                    .sort([col("CODE_TYPE_FLUX").asc(), col("CODE_IMPUTATION").asc(), col("ANNEE").asc(), col("CODE_MOIS").asc()])
+    st.session_state['updated_df']=updated_df    
+    #updated_df.write.mode("overwrite").save_as_table(table_name)
+    
+    # budget monitoring dataframes    
+    st.session_state['df_all_budgets']=updated_df
+    st.session_state['df_budget']=updated_df.filter(col("ANNEE") == st.session_state['financial_year'])
+    
+    update_var_pivot(st.session_state['df_budget'])
+ 
+def update_table():
+    updated_spdf=st.session_state['updated_df']
+    updated_spdf.write.mode("overwrite").save_as_table('SUIVI_BUDGETAIRE')
+    st.session_state['update_tag']=False
+    st.session_state['validate_save']=True
+
+def nothing_table():
+    st.session_state['update_tag']=False
+    st.session_state['validate_save']=False
+
+def cancel_changes():
+    new_key=random.randint(1, 10)
+    while new_key == st.session_state["data_editor_forecasted_budget_key"]:
+        new_key = random.randint(1, 10)
+    st.session_state["data_editor_forecasted_budget_key"]=new_key
+    st.session_state["data_editor_forecasted_budget"]="data_editor_forecasted_budget_"+str(new_key) 
+    #st.write('reset')
+    
+def select_change():
+    abm_df=st.session_state['df_all_budgets']
+    # budget monitoring dataframe
+    st.session_state['df_budget']=abm_df.filter(col("ANNEE") == st.session_state['sel_financial_year'])
+    st.session_state['financial_year']=st.session_state['sel_financial_year']
+        
+    update_var_pivot(st.session_state['df_budget'])
+                                                                    
+                                                                    
+def update_var_pivot(bm_df):
+    # months lists
+    spdf_months=bm_df.select(col("CODE_MOIS"),col("MOIS")).distinct()
+    st.session_state['spdf_months']=spdf_months
+    pddf_months = spdf_months.to_pandas()
+    st.session_state['months_list']=pddf_months.sort_values(by=['CODE_MOIS']).loc[:,"MOIS"].to_list()
+    st.session_state['months_quoted']=["'{}'".format(month) for month in st.session_state['months_list']]
+    # forecasted budget
+    st.session_state['df_fb_pivot']=bm_df.drop("CODE_MOIS","M_REEL").pivot("MOIS", st.session_state['months_list']).sum("M_PREVISIONNEL") \
+                                                                    .sort(bm_df["CODE_TYPE_FLUX"],bm_df["CODE_IMPUTATION"],bm_df["ANNEE"])
+          
         
 # 
 # main procedure
@@ -107,150 +178,24 @@ def main():
 
     session = create_session()
     
+    # create table
+    # pdf_sb = pd.read_csv("suivi_budgetaire.csv", sep=";", header=0)
+    # spdf_sb = session.create_dataframe(pdf_sb)
+    # spdf_sb.write.mode("overwrite").save_as_table("SUIVI_BUDGETAIRE")
+    # spdf_sb
+    
     # 
-    # Initialization -> Loading country data
+    # Initialization -> Loading budget monitoring data
     # 
-    if 'df_COUNTRIES' not in st.session_state:
-        st.session_state['df_COUNTRIES']=session.sql("  SELECT   ISO||' '||NAME_EN as SEARCH_COUNTRY \
-                                                                ,ISO as COUNTRY_CODE \
-                                                                ,NAME_EN as COUNTRY_NAME \
-                                                        FROM REF_DEV.REF_GEOGRAPHIQUE_SAS.DATA_LANGUAGES \
-                                                        WHERE SOVEREIGN ='' \
-                                                        ORDER BY 1" )
-        
-    load_ref_list('df_COUNTRIES','countries_list','SEARCH_COUNTRY')
-   
-    #
-    # Initialization -> Loading data for towns and postcodes
-    #  
-    if 'df_PLACES_POSTCODES_DISPLAY' not in st.session_state:
-        st.session_state['country_code'] = 'FR'
-        st.session_state["country_key"] = 'FR France'
-        df_PLACES_POSTCODES_FR=get_dataset_places_postcodes(session,st.session_state['country_code'])
-        df_PLACES_POSTCODES_DISPLAY=df_PLACES_POSTCODES_FR.with_column("SELBOX", lit(False)) \
-                                                          .filter(sql_expr("NEUTRAL_LOCALITY LIKE 'PARIS%'")) \
-                                                          .sort(col("NEUTRAL_LOCALITY").asc(),col("NEUTRAL_POSTCODE").asc()) \
-                                                          .limit(50)
-        st.session_state['df_PLACES_POSTCODES_COUNTRY']=df_PLACES_POSTCODES_FR 
-        st.session_state['df_PLACES_POSTCODES_FR']=df_PLACES_POSTCODES_FR
-        st.session_state['df_PLACES_POSTCODES_DISPLAY']=df_PLACES_POSTCODES_DISPLAY
+    load_bm_table(session,"SUIVI_BUDGETAIRE")
     
-     
-    #
-    # Update of the list of towns/postcodes by country
-    #
-    b_country_input = False      
-    if 'selbox_country' in st.session_state and 'country_key' in st.session_state and st.session_state['selbox_country'] != st.session_state['country_key']:
-        b_country_input = True 
-    elif 'selbox_country' in st.session_state and 'country_key' not in st.session_state:
-        b_country_input = True
-        
-     
-        
-    if b_country_input:
-        df_pd_country_code=st.session_state['df_COUNTRIES'] \
-                                .select(col("COUNTRY_CODE")) \
-                                .filter(col("SEARCH_COUNTRY") == st.session_state['selbox_country']) \
-                                .to_pandas()
-        country_code=df_pd_country_code.iloc[0, 0]
-        if country_code == 'FR':
-            df_PLACES_POSTCODES=st.session_state['df_PLACES_POSTCODES_FR']
-            st.session_state['df_PLACES_POSTCODES_COUNTRY']=df_PLACES_POSTCODES
-        else:
-            st.session_state['df_PLACES_POSTCODES_COUNTRY']=get_dataset_places_postcodes(session,country_code)
-            if 'city_key' not in st.session_state and 'postcode_key' not in st.session_state:
-                df_PLACES_POSTCODES=st.session_state['df_PLACES_POSTCODES_COUNTRY']
-            elif 'city_key' in st.session_state and 'postcode_key' not in st.session_state:
-                df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                    country_code,
-                                                                    p_city_name=st.session_state['city_key'],
-                                                                    p_df_country=st.session_state['df_PLACES_POSTCODES_COUNTRY']    )
-            elif 'city_key' not in st.session_state and 'postcode_key' in st.session_state:
-                df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                    country_code,
-                                                                    p_postcode=st.session_state['postcode_key'],
-                                                                    p_df_country=st.session_state['df_PLACES_POSTCODES_COUNTRY']    )
-            elif 'city_key' in st.session_state and 'postcode_key' in st.session_state:
-                df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                    country_code,
-                                                                    p_city_name=st.session_state['city_key'],
-                                                                    p_postcode=st.session_state['postcode_key'],
-                                                                    p_df_country=st.session_state['df_PLACES_POSTCODES_COUNTRY']    )
-                    
-        
-        st.session_state['df_PLACES_POSTCODES_DISPLAY']=df_PLACES_POSTCODES.with_column("SELBOX", lit(False)) \
-                                                                           .sort(col("NEUTRAL_LOCALITY").asc(),col("NEUTRAL_POSTCODE").asc()) \
-                                                                           .limit(50)
-        st.session_state['country_code'] = country_code
-        st.session_state['country_key'] = st.session_state['selbox_country']
-        
-    
-    #
-    # Update of the list of towns/postcodes by city or postcode
-    # 
-
-    b_city_input = False
-    b_postcode_input = False
-    if 'city_key' in st.session_state and 'city_name_key' in st.session_state and st.session_state['city_key'] != st.session_state['city_name_key']:
-        b_city_input = True
-    elif 'city_key' in st.session_state and 'city_name_key' not in st.session_state:
-        b_city_input = True  
-    elif 'postcode_key' in st.session_state and 'postcode_code_key' in st.session_state and st.session_state['postcode_key'] != st.session_state['postcode_code_key']:
-        b_postcode_input = True
-    elif 'postcode_key' in st.session_state and 'postcode_code_key' not in st.session_state:
-        b_postcode_input = True     
-    
-    if b_city_input or b_postcode_input:
-                           
-        if b_city_input:
-            vcity_name_search=st.session_state['city_key']
-        elif 'city_name_key' in st.session_state:
-            vcity_name_search=st.session_state['city_name_key']
-        else:
-            vcity_name_search=''
-
-        if b_postcode_input:
-            vpostcode_search=st.session_state['postcode_key']
-        elif 'postcode_code_key' in st.session_state:
-            vpostcode_search=st.session_state['postcode_code_key']
-        else:
-            vpostcode_search=''
-                                
-        ##
-        ## define reload dataframe 
-        ##
-                
-        if vcity_name_search != '' and vpostcode_search != '': 
-            df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                st.session_state['country_code'],
-                                                                p_city_name=vcity_name_search,
-                                                                p_postcode=vpostcode_search,
-                                                                p_df_country=st.session_state['df_PLACES_POSTCODES_COUNTRY']    )    
-        elif vcity_name_search != '' and vpostcode_search == '':
-            df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                st.session_state['country_code'],
-                                                                p_city_name=vcity_name_search,
-                                                                p_df_country=st.session_state['df_PLACES_POSTCODES_COUNTRY']    )     
-        elif vcity_name_search == '' and vpostcode_search != '':
-            df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                st.session_state['country_code'],
-                                                                p_postcode=vpostcode_search,
-                                                                p_df_country=st.session_state['df_PLACES_POSTCODES_COUNTRY']    )
-        else:
-            df_PLACES_POSTCODES=get_dataset_places_postcodes(   session,
-                                                                st.session_state['country_code']   )                 
- 
-        st.session_state['df_PLACES_POSTCODES_DISPLAY']=df_PLACES_POSTCODES.with_column("SELBOX", lit(False)) \
-                                                                           .sort(col("NEUTRAL_LOCALITY").asc(),col("NEUTRAL_POSTCODE").asc()) \
-                                                                           .limit(50)   
-        st.session_state['city_name_key']=vcity_name_search
-        st.session_state['postcode_code_key']=vpostcode_search
-
-    
-    st.header("Selection of towns in the geographic reference database")
+    # get the financial years
+    #load_fy_list()
+       
+    st.header("Mise à jour du budget prévisionnel")
     
     begin = st.sidebar.container()
-    
+        
     m = st.markdown("""
         <style>
         div.stButton > button:first-child {
@@ -276,105 +221,205 @@ def main():
         </style>""", unsafe_allow_html=True)
     
     with st.sidebar.container():
-        
-        countries_sel = begin.selectbox(
-            'Which country for your address?',
-            st.session_state['countries_list'],              
-            #default = st.session_state['msel_default_list'],  
-            key = 'selbox_country',
-            index=st.session_state['countries_list'].index('FR France'),                              
-            #on_change=selectbox_country_change,                        
-            placeholder = 'Choose your country'
-        )
+        # if st.sidebar.button('Validate', type="primary", on_click=validate_changes, use_container_width = True):
+        #     st.write(':blue[Changes validated !]')
             
-        place_sel = st_keyup('Which city for your address?'
-                                #,on_change=text_city_change
-                                ,key="city_key"
-                                ,placeholder = 'Choose your city'
-                                ,debounce=500)
+        if st.sidebar.button('Save', type="primary", on_click=tag_save_changes, use_container_width = True):
+            st.write(':orange[Changes in progress !]')
         
-        poscode_sel = st_keyup('Which postcode for your address?'
-                                #,on_change=text_postcode_change
-                                ,key="postcode_key"
-                                ,placeholder = 'Choose your postcode'
-                                ,debounce=500)
+        if st.sidebar.button("Reset", type="primary", on_click=cancel_changes, use_container_width = True):
+            st.write(':red[Changes cancelled !]')
+      
+    Third = st.sidebar.container()      
+    
+    financial_year_sel = begin.selectbox(
+        "Pour quelle année d'exercice ?",
+        st.session_state['financial_years_list'],
+        index=0,
+        key = 'sel_financial_year',
+        on_change=select_change, 
+        placeholder="Selection de l'année ...",
+    )
+    
+    #st.write('branch_sel : ', branch_sel )
+    
+    tab1, tab2 = st.tabs(["Forecasting", "Overview"])
+    
+    with tab1: 
+                
+        edited_forecasted_budget_df = st.data_editor(
+                        st.session_state['df_fb_pivot'],
+                        hide_index=True, 
+                        num_rows='fixed',
+                        disabled=[("CODE_TYPE_FLUX"),("TYPE_FLUX"),("CODE_IMPUTATION"),("IMPUTATION"),("ANNEE")],
+                        column_config={
+                            "CODE_TYPE_FLUX": None,
+                            "TYPE_FLUX": "Flux",
+                            "CODE_IMPUTATION": None,
+                            "IMPUTATION": "Imputation",
+                            "ANNEE": None,
+                            "MOIS": None,
+                            "'janvier'": st.column_config.NumberColumn(
+                                "Janvier Prev",
+                                help="Montant prévisionnel pour le mois de janvier",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'février'": st.column_config.NumberColumn(
+                                "Février Prev",
+                                help="Montant prévisionnel pour le mois de février",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'mars'": st.column_config.NumberColumn(
+                                "Mars Prev",
+                                help="Montant prévisionnel pour le mois de mars",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'avril'": st.column_config.NumberColumn(
+                                "Avril Prev",
+                                help="Montant prévisionnel pour le mois de avril",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'mai'": st.column_config.NumberColumn(
+                                "Mai Prev",
+                                help="Montant prévisionnel pour le mois de mai",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'juin'": st.column_config.NumberColumn(
+                                "Juin Prev",
+                                help="Montant prévisionnel pour le mois de juin",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'juillet'": st.column_config.NumberColumn(
+                                "Juillet Prev",
+                                help="Montant prévisionnel pour le mois de juillet",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'août'": st.column_config.NumberColumn(
+                                "Août Prev",
+                                help="Montant prévisionnel pour le mois d'août",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'septembre'": st.column_config.NumberColumn(
+                                "Septembre Prev",
+                                help="Montant prévisionnel pour le mois de septembre",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'octobre'": st.column_config.NumberColumn(
+                                "Octobre Prev",
+                                help="Montant prévisionnel pour le mois d'octobre",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'novembre'": st.column_config.NumberColumn(
+                                "Novembre Prev",
+                                help="Montant prévisionnel pour le mois de novembre",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            ),
+                            "'décembre'": st.column_config.NumberColumn(
+                                "Décembre Prev",
+                                help="Montant prévisionnel pour le mois de décembre",
+                                min_value=-10000000,
+                                max_value=10000000,
+                                step=1,
+                                format="%d €",
+                            )
+                        },
+                        use_container_width=True, 
+                        key=st.session_state["data_editor_forecasted_budget"], 
+                        height = 700)
+         
+        #st.write('edited_forecasted_budget_df : ', edited_forecasted_budget_df)
         
-        with st.sidebar.container():
+        #st.session_state['edited_forecasted_budget_spdf']=session.create_dataframe(edited_forecasted_budget_df)
+        #modified_forecasted_budget_spdf
+        #modified_forecasted_budget_spdf.schema 
         
-            edited_locality_postcode_list = st.sidebar.data_editor(
-                    st.session_state['df_PLACES_POSTCODES_DISPLAY'],
-                    hide_index=True, 
-                    num_rows='fixed',
-                    disabled=[("PLACE_ID"),("LOCALITY"),("POSTCODE"),("REGION_ID"),("REGION_NAME")],
-                    column_config={
-                        "COUNTRY_CODE": None,
-                        "COUNTRY_NAME": None,
-                        "PLACE_ID": None,
-                        "LOCALITY": "City Name",
-                        "NEUTRAL_LOCALITY": None,
-                        "POSTCODE_ID": None,
-                        "POSTCODE": "PostCode",
-                        "NEUTRAL_POSTCODE": None,
-                        "REGION_ID": None,
-                        "REGION_NAME": None,
-                        "SELBOX" : "Select ?"
-                    },
-                    use_container_width=True, 
-                    key='data_editor_locality_postcode_list', 
-                    height = 500)
+        #st.write('edited_forecasted_budget_df : ', st.session_state[st.session_state["data_editor_forecasted_budget"]]['edited_rows'])
+        
+        if st.session_state['update_tag']:
+            st.session_state['edited_forecasted_budget_spdf']=session.create_dataframe(edited_forecasted_budget_df)
+            save_changes()
+            st.write('Mises à jour : ', st.session_state[st.session_state["data_editor_forecasted_budget"]]['edited_rows'])
             
-    
-    b_de_update = False
-    b_de_select_exists = False
-    if 'data_editor_locality_postcode_list' in st.session_state:
-        b_de_update = len(st.session_state["data_editor_locality_postcode_list"]['edited_rows'])>0
-        if b_de_update:
-            Id_DE_select_list=[key for (key,value) in sorted(st.session_state["data_editor_locality_postcode_list"]['edited_rows'].items()) if value["SELBOX"] == True ]
-            if len(Id_DE_select_list)>0:
-                Id_DE_select_box=Id_DE_select_list[0]
-                v_place_id = st.session_state['df_PLACES_POSTCODES_DISPLAY'].collect()[Id_DE_select_box]['PLACE_ID']
-                v_postcode_id = st.session_state['df_PLACES_POSTCODES_DISPLAY'].collect()[Id_DE_select_box]['POSTCODE_ID']
-                st.session_state['df_PLACES_POSTCODES_DISPLAY2'] = st.session_state['df_PLACES_POSTCODES_DISPLAY'].filter((col("PLACE_ID") == v_place_id) & (col("POSTCODE_ID") == v_postcode_id))
-                b_de_select_exists = True
-            else:
-                st.session_state['df_PLACES_POSTCODES_DISPLAY2'] = st.session_state['df_PLACES_POSTCODES_DISPLAY']  
-        else:
-            st.session_state['df_PLACES_POSTCODES_DISPLAY2'] = st.session_state['df_PLACES_POSTCODES_DISPLAY']  
-    else:
-        st.session_state['df_PLACES_POSTCODES_DISPLAY2'] = st.session_state['df_PLACES_POSTCODES_DISPLAY']
-           
-    if b_de_update != True or b_de_select_exists != True:
-        edited_df_result = st.data_editor(
-                    st.session_state['df_PLACES_POSTCODES_DISPLAY2'],
-                    hide_index=True, 
-                    num_rows='dynamic',
-                    column_config={
-                            "COUNTRY_CODE": "Country Name",
-                            "COUNTRY_NAME": "Country Code",
-                            "PLACE_ID": "Place Id",
-                            "LOCALITY": "City Name",
-                            "NEUTRAL_LOCALITY": "Neutral Locality",
-                            "POSTCODE_ID": "Postcode Id",
-                            "POSTCODE": "PostCode",
-                            "NEUTRAL_POSTCODE": "Neutral Postcode",
-                            "REGION_ID": "Region Id",
-                            "REGION_NAME": "Region Name",
-                            "SELBOX" : None
-                        }, 
-                    key='data_editor', 
-                    height = 700 )
-    else:
-        st.subheader("Information on the selected location : ")
-        i_country_code = st.text_input("Country Code", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['COUNTRY_CODE'])
-        i_country_name = st.text_input("Country Name", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['COUNTRY_NAME'])
-        i_place_id = st.text_input("Place Id", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['PLACE_ID'])
-        i_locality = st.text_input("City Name", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['LOCALITY'])
-        i_postcode_id = st.text_input("Postcode Id", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['POSTCODE_ID'])
-        i_poscode = st.text_input("Postcode", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['POSTCODE'])
-        i_region_id = st.text_input("Region Id", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['REGION_ID'])
-        i_region_name = st.text_input("Region Name", disabled=True, value=st.session_state['df_PLACES_POSTCODES_DISPLAY2'].collect()[0]['REGION_NAME'])      
-
-    
+            Third.write(" Voulez-vous confirmer ?")
+            with st.sidebar.container():       
+                col1, col2 = st.columns(2)
+                col1.button('Oui', type="secondary", on_click=update_table)
+                col2.button('Non', type="primary", on_click=nothing_table)
+        
+        if st.session_state['validate_save']==True:
+            Third.write(':green[Changes saved in the table !]')
+            st.session_state['validate_save']=None
+        elif st.session_state['validate_save']==False:
+            Third.write(':blue[No Changes in the table !]')
+            st.session_state['validate_save']=None
+        
+        
+                        
+    with tab2:
+                    
+        #st.subheader("Elaborer un tableau synthétique avec montants Réels v Prévisionnels")
+        
+        pddf_budget=st.session_state['df_budget'].to_pandas()
+        st.write('pddf_budget : ',  pddf_budget)
+        
+        pddf_budget_prev=pddf_budget.drop('M_REEL', axis=1).rename(columns={'M_PREVISIONNEL': 'MONTANT'})
+        pddf_budget_reel=pddf_budget.drop('M_PREVISIONNEL', axis=1).rename(columns={'M_REEL': 'MONTANT'})
+        pddf_budget_prev['TYPE_MONTANT'] ="Prév."
+        pddf_budget_prev['ANNEE'] = pddf_budget_prev['ANNEE'].astype(str)
+        pddf_budget_prev['CODE_MOIS'] = pddf_budget_prev['CODE_MOIS'].astype(str)
+        pddf_budget_reel['TYPE_MONTANT'] ="Réel"
+        pddf_budget_reel['ANNEE'] = pddf_budget_reel['ANNEE'].astype(str)
+        pddf_budget_reel['CODE_MOIS'] = pddf_budget_reel['CODE_MOIS'].astype(str)
+        
+        pddf_budget_change=pd.concat([pddf_budget_prev, pddf_budget_reel], ignore_index=True)
+        
+        #pddf_budget = pddf_budget.set_index(['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'])
+        # pivot_budget_pddf=pd.pivot_table(pddf_budget_reel, values=['M_PREVISIONNEL','M_REEL'], \
+        #                                               index=['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'], \
+        #                                               columns=['ANNEE', 'CODE_MOIS', 'MOIS'] )
+        # pivot_budget_pddf=pd.pivot_table(pddf_budget_change, values='MONTANT', \
+        #                                               index=['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'], \
+        #                                               columns=['ANNEE', 'CODE_MOIS', 'MOIS','TYPE_MONTANT'] )
+        pivot_budget_pddf=pd.pivot_table(pddf_budget_change, values='MONTANT', \
+                                                      index=['TYPE_FLUX', 'IMPUTATION'], \
+                                                      columns=['ANNEE','CODE_MOIS','MOIS','TYPE_MONTANT'] )
+        st.write('pivot_budget_pddf : ',  pivot_budget_pddf)
+        
+        st.table(pivot_budget_pddf)
+        
 # 
 # run it!
 # 
