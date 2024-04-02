@@ -14,6 +14,7 @@ import unicodedata
 import re
 import locale
 import random
+from mitosheet.streamlit.v1 import spreadsheet
 
 
 # Function to create Snowflake Session to connect to Snowflake
@@ -419,6 +420,15 @@ def main():
         st.write('pivot_budget_pddf : ',  pivot_budget_pddf)
         
         st.table(pivot_budget_pddf)
+        
+        st.title('Tesla Stock Volume Analysis')
+
+        CSV_URL = 'https://raw.githubusercontent.com/plotly/datasets/master/tesla-stock-price.csv'
+        new_dfs, code = spreadsheet(CSV_URL)
+        
+        st.write(code)
+        
+        st.write(new_dfs)
         
 # 
 # run it!
