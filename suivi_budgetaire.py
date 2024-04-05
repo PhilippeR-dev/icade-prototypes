@@ -15,6 +15,8 @@ import re
 import locale
 import random
 from mitosheet.streamlit.v1 import spreadsheet
+import datetime
+import time
 
 
 # Function to create Snowflake Session to connect to Snowflake
@@ -84,9 +86,8 @@ def load_bm_table(session,table_name,financial_year=2024):
         
         st.session_state["data_editor_forecasted_budget_key"]=0
         st.session_state["data_editor_forecasted_budget"]="data_editor_forecasted_budget_0"
-        st.session_state['update_tag']=False
-        st.session_state['updated_df']=None
         st.session_state['validate_save']=None
+        st.session_state['go_save']=False
                    
         #st.write('initialisation')
          
@@ -98,11 +99,9 @@ def load_bm_table(session,table_name,financial_year=2024):
 #         pddf_fy=spdf_fy.to_pandas()
 #         st.session_state['financial_years_list']=pddf_fy.sort_values(by=['ANNEE'], ascending=False).loc[:,"ANNEE"].to_list()
 
-def tag_save_changes():
-    st.session_state['update_tag']=True
         
-def save_changes():
-    efb_spdf = st.session_state['edited_forecasted_budget_spdf']
+def save_changes(efb_spdf):
+    #efb_spdf = st.session_state['edited_forecasted_budget_spdf']
     # Convertir les colonnes de type LongType contenant des valeurs nulles en DoubleType
     for column in st.session_state['months_quoted']: 
         efb_spdf = efb_spdf.withColumn(column, efb_spdf[column].cast("DOUBLE"))
@@ -113,30 +112,26 @@ def save_changes():
     
     abm_df=st.session_state['df_all_budgets']      
     updated_df=abm_df.join(unpivot_months_fb_df, on=["CODE_TYPE_FLUX","CODE_IMPUTATION","ANNEE","CODE_MOIS"], how="leftouter", rsuffix="_L", lsuffix="_R") \
-                    .select(    col("CODE_TYPE_FLUX"),col("TYPE_FLUX_R").alias("TYPE_FLUX"), \
+                     .select(    col("CODE_TYPE_FLUX"),col("TYPE_FLUX_R").alias("TYPE_FLUX"), \
                                 col("CODE_IMPUTATION"),col("IMPUTATION_R").alias("IMPUTATION"), \
                                 col("ANNEE"),col("CODE_MOIS"),col("MOIS_R").alias("MOIS"), col("MOIS_L"), \
                                 iff(col("MOIS_L").isNull(),col("M_PREVISIONNEL_R"),col("M_PREVISIONNEL_L")).alias("M_PREVISIONNEL") \
                                 ,"M_PREVISIONNEL_R","M_PREVISIONNEL_L",col("M_REEL") ) \
-                    .drop("M_PREVISIONNEL_R","M_PREVISIONNEL_L","MOIS_L") \
-                    .sort([col("CODE_TYPE_FLUX").asc(), col("CODE_IMPUTATION").asc(), col("ANNEE").asc(), col("CODE_MOIS").asc()])
-    st.session_state['updated_df']=updated_df    
-    #updated_df.write.mode("overwrite").save_as_table(table_name)
+                     .drop("M_PREVISIONNEL_R","M_PREVISIONNEL_L","MOIS_L") \
+                     .sort([col("CODE_TYPE_FLUX").asc(), col("CODE_IMPUTATION").asc(), col("ANNEE").asc(), col("CODE_MOIS").asc()])
     
     # budget monitoring dataframes    
     st.session_state['df_all_budgets']=updated_df
     st.session_state['df_budget']=updated_df.filter(col("ANNEE") == st.session_state['financial_year'])
     
     update_var_pivot(st.session_state['df_budget'])
+    
+    return updated_df
  
 def update_table():
-    updated_spdf=st.session_state['updated_df']
-    updated_spdf.write.mode("overwrite").save_as_table('SUIVI_BUDGETAIRE')
-    st.session_state['update_tag']=False
     st.session_state['validate_save']=True
 
 def nothing_table():
-    st.session_state['update_tag']=False
     st.session_state['validate_save']=False
 
 def cancel_changes():
@@ -163,10 +158,16 @@ def update_var_pivot(bm_df):
     pddf_months = spdf_months.to_pandas()
     st.session_state['months_list']=pddf_months.sort_values(by=['CODE_MOIS']).loc[:,"MOIS"].to_list()
     st.session_state['months_quoted']=["'{}'".format(month) for month in st.session_state['months_list']]
+
+@st.cache_data
+def get_forecast_budget(_abm_df,p_year):
+    df_budget=_abm_df.filter(col("ANNEE") == p_year)
+    st.session_state['df_budget']=df_budget
     # forecasted budget
-    st.session_state['df_fb_pivot']=bm_df.drop("CODE_MOIS","M_REEL").pivot("MOIS", st.session_state['months_list']).sum("M_PREVISIONNEL") \
-                                                                    .sort(bm_df["CODE_TYPE_FLUX"],bm_df["CODE_IMPUTATION"],bm_df["ANNEE"])
-          
+    return df_budget.drop("CODE_MOIS","M_REEL").pivot("MOIS", st.session_state['months_list']).sum("M_PREVISIONNEL") \
+                                               .sort(df_budget["CODE_TYPE_FLUX"],df_budget["CODE_IMPUTATION"],df_budget["ANNEE"]) \
+                                               .collect() 
+                                                                                           
         
 # 
 # main procedure
@@ -174,11 +175,12 @@ def update_var_pivot(bm_df):
 
 def main():
     
+       
     # Set page config
     st.set_page_config(layout="wide") 
 
     session = create_session()
-    
+
     # create table
     # pdf_sb = pd.read_csv("suivi_budgetaire.csv", sep=";", header=0)
     # spdf_sb = session.create_dataframe(pdf_sb)
@@ -192,7 +194,7 @@ def main():
     
     # get the financial years
     #load_fy_list()
-       
+     
     st.header("Mise à jour du budget prévisionnel")
     
     begin = st.sidebar.container()
@@ -221,17 +223,18 @@ def main():
 
         </style>""", unsafe_allow_html=True)
     
-    with st.sidebar.container():
-        # if st.sidebar.button('Validate', type="primary", on_click=validate_changes, use_container_width = True):
-        #     st.write(':blue[Changes validated !]')
-            
-        if st.sidebar.button('Save', type="primary", on_click=tag_save_changes, use_container_width = True):
-            st.write(':orange[Changes in progress !]')
+    with st.sidebar.container():            
         
-        if st.sidebar.button("Reset", type="primary", on_click=cancel_changes, use_container_width = True):
-            st.write(':red[Changes cancelled !]')
+        st.session_state['button_reset']=st.sidebar.button("Reset", type="primary", on_click=cancel_changes, use_container_width = True)
+        if st.session_state['button_reset']:
+            #st.write(':red[Changes cancelled !]')
+            placeholder = st.empty()
+            placeholder.write(':red[Changes cancelled !]')
+            time.sleep(1)
+            placeholder.empty()
       
     Third = st.sidebar.container()      
+    Fourth = st.sidebar.container()
     
     financial_year_sel = begin.selectbox(
         "Pour quelle année d'exercice ?",
@@ -242,193 +245,201 @@ def main():
         placeholder="Selection de l'année ...",
     )
     
-    #st.write('branch_sel : ', branch_sel )
-    
     tab1, tab2 = st.tabs(["Forecasting", "Overview"])
     
     with tab1: 
-                
-        edited_forecasted_budget_df = st.data_editor(
-                        st.session_state['df_fb_pivot'],
-                        hide_index=True, 
-                        num_rows='fixed',
-                        disabled=[("CODE_TYPE_FLUX"),("TYPE_FLUX"),("CODE_IMPUTATION"),("IMPUTATION"),("ANNEE")],
-                        column_config={
-                            "CODE_TYPE_FLUX": None,
-                            "TYPE_FLUX": "Flux",
-                            "CODE_IMPUTATION": None,
-                            "IMPUTATION": "Imputation",
-                            "ANNEE": None,
-                            "MOIS": None,
-                            "'janvier'": st.column_config.NumberColumn(
-                                "Janvier Prev",
-                                help="Montant prévisionnel pour le mois de janvier",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'février'": st.column_config.NumberColumn(
-                                "Février Prev",
-                                help="Montant prévisionnel pour le mois de février",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'mars'": st.column_config.NumberColumn(
-                                "Mars Prev",
-                                help="Montant prévisionnel pour le mois de mars",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'avril'": st.column_config.NumberColumn(
-                                "Avril Prev",
-                                help="Montant prévisionnel pour le mois de avril",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'mai'": st.column_config.NumberColumn(
-                                "Mai Prev",
-                                help="Montant prévisionnel pour le mois de mai",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'juin'": st.column_config.NumberColumn(
-                                "Juin Prev",
-                                help="Montant prévisionnel pour le mois de juin",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'juillet'": st.column_config.NumberColumn(
-                                "Juillet Prev",
-                                help="Montant prévisionnel pour le mois de juillet",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'août'": st.column_config.NumberColumn(
-                                "Août Prev",
-                                help="Montant prévisionnel pour le mois d'août",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'septembre'": st.column_config.NumberColumn(
-                                "Septembre Prev",
-                                help="Montant prévisionnel pour le mois de septembre",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'octobre'": st.column_config.NumberColumn(
-                                "Octobre Prev",
-                                help="Montant prévisionnel pour le mois d'octobre",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'novembre'": st.column_config.NumberColumn(
-                                "Novembre Prev",
-                                help="Montant prévisionnel pour le mois de novembre",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            ),
-                            "'décembre'": st.column_config.NumberColumn(
-                                "Décembre Prev",
-                                help="Montant prévisionnel pour le mois de décembre",
-                                min_value=-10000000,
-                                max_value=10000000,
-                                step=1,
-                                format="%d €",
-                            )
-                        },
-                        use_container_width=True, 
-                        key=st.session_state["data_editor_forecasted_budget"], 
-                        height = 700)
-         
-        #st.write('edited_forecasted_budget_df : ', edited_forecasted_budget_df)
         
-        #st.session_state['edited_forecasted_budget_spdf']=session.create_dataframe(edited_forecasted_budget_df)
-        #modified_forecasted_budget_spdf
-        #modified_forecasted_budget_spdf.schema 
-        
-        #st.write('edited_forecasted_budget_df : ', st.session_state[st.session_state["data_editor_forecasted_budget"]]['edited_rows'])
-        
-        if st.session_state['update_tag']:
-            st.session_state['edited_forecasted_budget_spdf']=session.create_dataframe(edited_forecasted_budget_df)
-            save_changes()
-            st.write('Mises à jour : ', st.session_state[st.session_state["data_editor_forecasted_budget"]]['edited_rows'])
+       
+        dataset_fb=get_forecast_budget(st.session_state['df_all_budgets'],st.session_state['sel_financial_year'])
             
+        with st.form("data_editor_form"):      
+            edited_forecasted_budget_df = st.data_editor(
+                            dataset_fb,
+                            hide_index=True, 
+                            num_rows='fixed',
+                            disabled=[("CODE_TYPE_FLUX"),("TYPE_FLUX"),("CODE_IMPUTATION"),("IMPUTATION"),("ANNEE")],
+                            column_config={
+                                "CODE_TYPE_FLUX": None,
+                                "TYPE_FLUX": "Flux",
+                                "CODE_IMPUTATION": None,
+                                "IMPUTATION": "Imputation",
+                                "ANNEE": None,
+                                "MOIS": None,
+                                "'janvier'": st.column_config.NumberColumn(
+                                    "Janvier Prev",
+                                    help="Montant prévisionnel pour le mois de janvier",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'février'": st.column_config.NumberColumn(
+                                    "Février Prev",
+                                    help="Montant prévisionnel pour le mois de février",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'mars'": st.column_config.NumberColumn(
+                                    "Mars Prev",
+                                    help="Montant prévisionnel pour le mois de mars",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'avril'": st.column_config.NumberColumn(
+                                    "Avril Prev",
+                                    help="Montant prévisionnel pour le mois de avril",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'mai'": st.column_config.NumberColumn(
+                                    "Mai Prev",
+                                    help="Montant prévisionnel pour le mois de mai",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'juin'": st.column_config.NumberColumn(
+                                    "Juin Prev",
+                                    help="Montant prévisionnel pour le mois de juin",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'juillet'": st.column_config.NumberColumn(
+                                    "Juillet Prev",
+                                    help="Montant prévisionnel pour le mois de juillet",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'août'": st.column_config.NumberColumn(
+                                    "Août Prev",
+                                    help="Montant prévisionnel pour le mois d'août",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'septembre'": st.column_config.NumberColumn(
+                                    "Septembre Prev",
+                                    help="Montant prévisionnel pour le mois de septembre",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'octobre'": st.column_config.NumberColumn(
+                                    "Octobre Prev",
+                                    help="Montant prévisionnel pour le mois d'octobre",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'novembre'": st.column_config.NumberColumn(
+                                    "Novembre Prev",
+                                    help="Montant prévisionnel pour le mois de novembre",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                ),
+                                "'décembre'": st.column_config.NumberColumn(
+                                    "Décembre Prev",
+                                    help="Montant prévisionnel pour le mois de décembre",
+                                    min_value=-10000000,
+                                    max_value=10000000,
+                                    step=1,
+                                    format="%d €",
+                                )
+                            },
+                            use_container_width=True, 
+                            key=st.session_state["data_editor_forecasted_budget"],
+                            height = 700)
+            submit_button = st.form_submit_button("Save", use_container_width=True)
+
+        if submit_button:
+            Third.write(':orange[Changes in progress !]')
+            st.session_state['go_save']=True
+            st.write('Mises à jour : ', st.session_state[st.session_state["data_editor_forecasted_budget"]]['edited_rows'])
             Third.write(" Voulez-vous confirmer ?")
-            with st.sidebar.container():       
-                col1, col2 = st.columns(2)
-                col1.button('Oui', type="secondary", on_click=update_table)
-                col2.button('Non', type="primary", on_click=nothing_table)
-        
-        if st.session_state['validate_save']==True:
-            Third.write(':green[Changes saved in the table !]')
-            st.session_state['validate_save']=None
-        elif st.session_state['validate_save']==False:
-            Third.write(':blue[No Changes in the table !]')
-            st.session_state['validate_save']=None
-        
+            col1, col2 = Third.columns(2)
+            col1.button('Oui', type="secondary", on_click=update_table)
+            col2.button('Non', type="primary", on_click=nothing_table)
+
+                
+        if st.session_state['go_save']:
+            
+            placeholder_vs = Fourth.empty() 
+            
+            if st.session_state['validate_save']:
+                updated_spdf=save_changes(session.create_dataframe(edited_forecasted_budget_df))
+                updated_spdf.write.mode("overwrite").save_as_table('SUIVI_BUDGETAIRE')
+                st.session_state['validate_save']=None
+                st.session_state['go_save']=False
+                placeholder_vs.write(':green[Changes saved in the table !]')
+                time.sleep(1)
+                                
+            if st.session_state['validate_save']==False:
+                st.session_state['validate_save']=None
+                st.session_state['go_save']=False
+                placeholder_vs.write(':blue[No Changes in the table !]')
+                time.sleep(1)
+            
+            placeholder_vs.empty() 
+                
         
                         
     with tab2:
                     
-        #st.subheader("Elaborer un tableau synthétique avec montants Réels v Prévisionnels")
+        st.subheader("Elaborer un tableau synthétique avec montants Réels v Prévisionnels")
         
-        pddf_budget=st.session_state['df_budget'].to_pandas()
-        st.write('pddf_budget : ',  pddf_budget)
+        # pddf_budget=st.session_state['df_budget'].to_pandas()
+        # st.write('pddf_budget : ',  pddf_budget)
         
-        pddf_budget_prev=pddf_budget.drop('M_REEL', axis=1).rename(columns={'M_PREVISIONNEL': 'MONTANT'})
-        pddf_budget_reel=pddf_budget.drop('M_PREVISIONNEL', axis=1).rename(columns={'M_REEL': 'MONTANT'})
-        pddf_budget_prev['TYPE_MONTANT'] ="Prév."
-        pddf_budget_prev['ANNEE'] = pddf_budget_prev['ANNEE'].astype(str)
-        pddf_budget_prev['CODE_MOIS'] = pddf_budget_prev['CODE_MOIS'].astype(str)
-        pddf_budget_reel['TYPE_MONTANT'] ="Réel"
-        pddf_budget_reel['ANNEE'] = pddf_budget_reel['ANNEE'].astype(str)
-        pddf_budget_reel['CODE_MOIS'] = pddf_budget_reel['CODE_MOIS'].astype(str)
+        # pddf_budget_prev=pddf_budget.drop('M_REEL', axis=1).rename(columns={'M_PREVISIONNEL': 'MONTANT'})
+        # pddf_budget_reel=pddf_budget.drop('M_PREVISIONNEL', axis=1).rename(columns={'M_REEL': 'MONTANT'})
+        # pddf_budget_prev['TYPE_MONTANT'] ="Prév."
+        # pddf_budget_prev['ANNEE'] = pddf_budget_prev['ANNEE'].astype(str)
+        # pddf_budget_prev['CODE_MOIS'] = pddf_budget_prev['CODE_MOIS'].astype(str)
+        # pddf_budget_reel['TYPE_MONTANT'] ="Réel"
+        # pddf_budget_reel['ANNEE'] = pddf_budget_reel['ANNEE'].astype(str)
+        # pddf_budget_reel['CODE_MOIS'] = pddf_budget_reel['CODE_MOIS'].astype(str)
         
-        pddf_budget_change=pd.concat([pddf_budget_prev, pddf_budget_reel], ignore_index=True)
+        # pddf_budget_change=pd.concat([pddf_budget_prev, pddf_budget_reel], ignore_index=True)
         
-        #pddf_budget = pddf_budget.set_index(['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'])
-        # pivot_budget_pddf=pd.pivot_table(pddf_budget_reel, values=['M_PREVISIONNEL','M_REEL'], \
-        #                                               index=['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'], \
-        #                                               columns=['ANNEE', 'CODE_MOIS', 'MOIS'] )
+        # #pddf_budget = pddf_budget.set_index(['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'])
+        # # pivot_budget_pddf=pd.pivot_table(pddf_budget_reel, values=['M_PREVISIONNEL','M_REEL'], \
+        # #                                               index=['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'], \
+        # #                                               columns=['ANNEE', 'CODE_MOIS', 'MOIS'] )
+        # # pivot_budget_pddf=pd.pivot_table(pddf_budget_change, values='MONTANT', \
+        # #                                               index=['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'], \
+        # #                                               columns=['ANNEE', 'CODE_MOIS', 'MOIS','TYPE_MONTANT'] )
         # pivot_budget_pddf=pd.pivot_table(pddf_budget_change, values='MONTANT', \
-        #                                               index=['CODE_TYPE_FLUX', 'TYPE_FLUX', 'CODE_IMPUTATION', 'IMPUTATION'], \
-        #                                               columns=['ANNEE', 'CODE_MOIS', 'MOIS','TYPE_MONTANT'] )
-        pivot_budget_pddf=pd.pivot_table(pddf_budget_change, values='MONTANT', \
-                                                      index=['TYPE_FLUX', 'IMPUTATION'], \
-                                                      columns=['ANNEE','CODE_MOIS','MOIS','TYPE_MONTANT'] )
-        st.write('pivot_budget_pddf : ',  pivot_budget_pddf)
+        #                                               index=['TYPE_FLUX', 'IMPUTATION'], \
+        #                                               columns=['ANNEE','CODE_MOIS','MOIS','TYPE_MONTANT'] )
+        # st.write('pivot_budget_pddf : ',  pivot_budget_pddf)
         
-        st.table(pivot_budget_pddf)
+        # st.table(pivot_budget_pddf)
         
-        st.title('Tesla Stock Volume Analysis')
+        # st.title('Tesla Stock Volume Analysis')
 
-        CSV_URL = 'https://raw.githubusercontent.com/plotly/datasets/master/tesla-stock-price.csv'
-        new_dfs, code = spreadsheet(CSV_URL)
+        # CSV_URL = 'https://raw.githubusercontent.com/plotly/datasets/master/tesla-stock-price.csv'
+        # new_dfs, code = spreadsheet(CSV_URL)
         
-        st.write(code)
+        # st.write(code)
         
-        st.write(new_dfs)
+        # st.write(new_dfs)
+        
         
 # 
 # run it!
